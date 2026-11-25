@@ -1,8 +1,12 @@
 import type { ProviderSubagentStatus } from "../../../provider-subagents/store.js";
 import { mapTaskStatus } from "./task-status.js";
-import type { SDKMessage } from "@anthropic-ai/claude-agent-sdk";
+import type {
+  SDKMessage,
+  SDKTaskNotificationMessage,
+  SDKTaskUpdatedMessage,
+} from "@anthropic-ai/claude-agent-sdk";
 
-import type { AgentMetadata } from "../../../agent-sdk-types.js";
+import type { AgentNativeTaskObservation, AgentMetadata } from "../../../agent-sdk-types.js";
 import { resolveObservedClaudeModelId } from "../models.js";
 import type { SubagentObservation } from "./observation.js";
 import {
@@ -12,8 +16,8 @@ import {
 } from "./presentation.js";
 
 /**
- * Claude Code announces subagent lifecycle on the SDK stream. This reads those announcements
- * instead of reconstructing them from sidechain frames.
+ * Claude Code announces native task lifecycle on the SDK stream. This retains observed task
+ * control state and derives subagent descriptors for agent/workflow tasks only.
  *
  * Verified on the wire (Claude Code 2.1.220, Paseo's own query options):
  *
@@ -22,8 +26,8 @@ import {
  *   task_updated       task_id, patch.status, patch.is_backgrounded
  *   task_notification  task_id, tool_use_id, status
  *
- * Only `task_started` carries `tool_use_id`, so the mapping from task id to the canonical
- * subagent id has to be remembered. Claude may re-announce a session task with a new tool id when
+ * `task_updated` lacks `tool_use_id`, so the mapping from task id to the canonical subagent id
+ * has to be remembered. Claude may re-announce a session task with a new tool id when
  * resuming it; later ids are aliases for the first id. The source also accumulates Claude's
  * presentation facts so the shared descriptor receives one complete provider-owned subtitle
  * rather than Claude fields.
@@ -48,8 +52,9 @@ interface TaskStartedMessage {
   is_backgrounded?: boolean;
 }
 
-/** Task-tool subagents. Backgrounded shell commands announce as `local_bash`. */
+/** Task-tool subagents. Registered shell commands announce as `local_bash`. */
 export const CLAUDE_SUBAGENT_TASK_TYPE = "local_agent";
+
 /** Workflow executions use the same announced task lifecycle as Task-tool subagents. */
 export const CLAUDE_WORKFLOW_TASK_TYPE = "local_workflow";
 
@@ -132,6 +137,7 @@ export interface ClaudeRestoredSubagent {
 }
 
 export interface ClaudeTaskProtocolSourceInput {
+  getToolContext?: (toolUseId: string) => { nativeSessionId: string; turnId: string } | null;
   /**
    * The parent's Task tool input, by tool_use id.
    *
@@ -144,7 +150,18 @@ export interface ClaudeTaskProtocolSourceInput {
   readWorkflowResult?: (outputFile: string) => string | undefined;
 }
 
+type NativeTaskStatus =
+  | NonNullable<SDKTaskUpdatedMessage["patch"]["status"]>
+  | SDKTaskNotificationMessage["status"];
+
+interface NativeTaskRegistration {
+  observation: AgentNativeTaskObservation;
+  runId: string | undefined;
+}
+
 export class ClaudeTaskProtocolSource {
+  private readonly nativeTasksById = new Map<string, NativeTaskRegistration>();
+  private readonly getToolContext: NonNullable<ClaudeTaskProtocolSourceInput["getToolContext"]>;
   /** task_id -> canonical subagent id (the Task tool_use id). Populated by task_started. */
   private readonly subagentIdByTaskId = new Map<string, string>();
   /** Every announced tool id -> the first tool id that publicly identifies the child. */
@@ -189,6 +206,7 @@ export class ClaudeTaskProtocolSource {
   private readonly readWorkflowResult: (outputFile: string) => string | undefined;
 
   constructor(input: ClaudeTaskProtocolSourceInput = {}) {
+    this.getToolContext = input.getToolContext ?? (() => null);
     this.getToolInput = input.getToolInput ?? (() => null);
     this.readWorkflowResult = input.readWorkflowResult ?? (() => undefined);
   }
@@ -248,6 +266,81 @@ export class ClaudeTaskProtocolSource {
     return !this.idsWithExistingParentToolCard.has(subagentId);
   }
 
+  getNativeTask(toolUseId: string): AgentNativeTaskObservation | undefined {
+    return [...this.nativeTasksById.values()].find(
+      ({ observation }) => observation.toolUseId === toolUseId,
+    )?.observation;
+  }
+
+  observeNativeTask(message: SDKMessage): AgentNativeTaskObservation | null {
+    if (message.type !== "system") return null;
+    if (message.subtype === "task_started") return this.observeNativeTaskStarted(message);
+    if (message.subtype !== "task_updated" && message.subtype !== "task_notification") return null;
+    const existing = this.nativeTasksById.get(message.task_id);
+    if (
+      !existing ||
+      existing.observation.nativeSessionId !== message.session_id ||
+      existing.runId !== message.run_id
+    )
+      return null;
+    if (message.subtype === "task_notification") {
+      if (message.tool_use_id && message.tool_use_id !== existing.observation.toolUseId)
+        return null;
+      return this.updateNativeTask(existing, message.status);
+    }
+    return this.updateNativeTask(existing, message.patch.status, message.patch.is_backgrounded);
+  }
+
+  private observeNativeTaskStarted(
+    message: Extract<SDKMessage, { subtype: "task_started" }>,
+  ): AgentNativeTaskObservation | null {
+    if (
+      !message.tool_use_id ||
+      !message.task_id ||
+      message.skip_transcript === true ||
+      !["local_bash", "local_agent", "local_workflow"].includes(message.task_type ?? "")
+    )
+      return null;
+    const existing = this.nativeTasksById.get(message.task_id);
+    if (existing) {
+      if (
+        existing.observation.nativeSessionId !== message.session_id ||
+        existing.observation.toolUseId !== message.tool_use_id ||
+        existing.runId !== message.run_id
+      )
+        return null;
+      return this.updateNativeTask(existing, undefined, message.is_backgrounded);
+    }
+    const context = this.getToolContext(message.tool_use_id);
+    if (!context || context.nativeSessionId !== message.session_id) return null;
+    const task: AgentNativeTaskObservation = {
+      ...context,
+      toolUseId: message.tool_use_id,
+      taskId: message.task_id,
+      state: observedNativeTaskPlacement(message.is_backgrounded),
+    };
+    this.nativeTasksById.set(task.taskId, { observation: task, runId: message.run_id });
+    return task;
+  }
+
+  private updateNativeTask(
+    registration: NativeTaskRegistration,
+    status?: NativeTaskStatus,
+    backgrounded?: boolean,
+  ): AgentNativeTaskObservation | null {
+    const task = registration.observation;
+    if (["completed", "failed", "stopped"].includes(task.state)) return null;
+    let state = task.state;
+    if (status === "completed" || status === "failed" || status === "stopped") state = status;
+    else if (status === "killed") state = "stopped";
+    else if (backgrounded === true) state = "background";
+    else if (backgrounded === false) state = "foreground";
+    if (state === task.state) return null;
+    const next = { ...task, state };
+    this.nativeTasksById.set(task.taskId, { ...registration, observation: next });
+    return next;
+  }
+
   observe(message: SDKMessage): SubagentObservation[] {
     if (message.type !== "system") return [];
     switch (message.subtype) {
@@ -280,6 +373,7 @@ export class ClaudeTaskProtocolSource {
    * live — see `cancelRunningForegroundTasks`, which is what a turn ending actually warrants.
    */
   reset(): void {
+    this.nativeTasksById.clear();
     this.subagentIdByTaskId.clear();
     this.canonicalIdByToolUseId.clear();
     this.ownerSubagentIdByToolUseId.clear();
@@ -315,6 +409,15 @@ export class ClaudeTaskProtocolSource {
       if (this.lastStatusById.get(id) !== "running") continue;
       this.lastStatusById.set(id, "canceled");
       observations.push({ kind: "status", id, status: "canceled" });
+    }
+    return observations;
+  }
+
+  failRunningNativeTasks(): AgentNativeTaskObservation[] {
+    const observations: AgentNativeTaskObservation[] = [];
+    for (const registration of this.nativeTasksById.values()) {
+      const failed = this.updateNativeTask(registration, "failed");
+      if (failed) observations.push(failed);
     }
     return observations;
   }
@@ -564,4 +667,12 @@ export class ClaudeTaskProtocolSource {
     this.lastStatusById.set(id, status);
     return [{ kind: "status", id, status }];
   }
+}
+
+function observedNativeTaskPlacement(
+  backgrounded: boolean | undefined,
+): AgentNativeTaskObservation["state"] {
+  if (backgrounded === true) return "background";
+  if (backgrounded === false) return "foreground";
+  return "unknown";
 }

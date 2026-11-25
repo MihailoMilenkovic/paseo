@@ -289,6 +289,7 @@ export const MutableDaemonConfigPatchSchema = z
 export type MutableDaemonConfig = z.infer<typeof MutableDaemonConfigSchema>;
 export type MutableDaemonConfigPatch = z.infer<typeof MutableDaemonConfigPatchSchema>;
 import type {
+  AgentNativeTaskObservation,
   AgentCapabilityFlags,
   AgentMetric,
   AgentModelDefinition,
@@ -472,6 +473,7 @@ const AgentCapabilityFlagsSchema: z.ZodType<AgentCapabilityFlags> = z
     supportsRewindFiles: z.boolean().optional().default(false),
     // COMPAT(rewind): added in v0.1.X, drop when floor >= v0.1.X.
     supportsRewindBoth: z.boolean().optional().default(false),
+    supportsTaskBackgrounding: z.boolean().optional(),
   })
   .catchall(z.boolean());
 
@@ -726,13 +728,26 @@ const ToolCallDetailPayloadSchema: z.ZodType<ToolCallDetail, unknown> = z.discri
   ],
 );
 
+export const AgentNativeTaskObservationSchema: z.ZodType<AgentNativeTaskObservation> = z.object({
+  nativeSessionId: z.string().min(1),
+  turnId: z.string().min(1),
+  toolUseId: z.string().min(1),
+  taskId: z.string().min(1),
+  state: z.enum(["unknown", "foreground", "background", "completed", "failed", "stopped"]),
+});
+
 const ToolCallBasePayloadSchema = z.object({
   agentMessage: AgentMessageSchema.optional(),
   type: z.literal("tool_call"),
   callId: z.string(),
   name: z.string(),
   detail: ToolCallDetailPayloadSchema,
-  metadata: z.record(z.string(), z.unknown()).optional(),
+  metadata: z
+    .intersection(
+      z.record(z.string(), z.unknown()),
+      z.object({ nativeTask: AgentNativeTaskObservationSchema.optional() }),
+    )
+    .optional(),
 });
 
 const ToolCallRunningPayloadSchema = ToolCallBasePayloadSchema.extend({
@@ -2278,6 +2293,40 @@ export const AgentDetachResponseMessageSchema = z.object({
   payload: AgentActionResponsePayloadSchema,
 });
 
+export const AgentBackgroundTaskTargetSchema = z.object({
+  expectedTaskId: z.string().min(1),
+  expectedNativeSessionId: z.string().min(1),
+  expectedTurnId: z.string().min(1),
+  toolUseId: z.string().min(1),
+});
+
+export const AgentBackgroundTaskResultSchema = z.discriminatedUnion("status", [
+  z.object({ status: z.literal("requested") }),
+  z.object({ status: z.literal("refused") }),
+  z.object({ status: z.literal("unsupported") }),
+  z.object({ status: z.literal("stale") }),
+  z.object({ status: z.literal("unconfirmed"), error: z.string() }),
+]);
+
+export const AgentBackgroundTaskRequestMessageSchema = z.object({
+  type: z.literal("agent.task.background.request"),
+  requestId: z.string(),
+  agentId: z.string().min(1),
+  target: AgentBackgroundTaskTargetSchema,
+});
+
+export const AgentBackgroundTaskResponseMessageSchema = z.object({
+  type: z.literal("agent.task.background.response"),
+  payload: z.object({
+    requestId: z.string(),
+    agentId: z.string(),
+    result: AgentBackgroundTaskResultSchema,
+  }),
+});
+
+export type AgentBackgroundTaskTarget = z.infer<typeof AgentBackgroundTaskTargetSchema>;
+export type AgentBackgroundTaskResult = z.infer<typeof AgentBackgroundTaskResultSchema>;
+
 export const AgentRewindModeSchema = z.enum(["conversation", "files", "both"]);
 
 export const AgentRewindRequestMessageSchema = z.object({
@@ -3697,6 +3746,7 @@ export const SessionInboundMessageSchema = z.discriminatedUnion("type", [
   SetAgentFeatureRequestMessageSchema,
   AgentConfigApplyRequestMessageSchema,
   AgentDetachRequestMessageSchema,
+  AgentBackgroundTaskRequestMessageSchema,
   AgentRewindRequestMessageSchema,
   AgentPermissionResponseMessageSchema,
   DiffSubscribeRequestSchema,
@@ -4088,6 +4138,7 @@ export const ServerInfoStatusPayloadSchema = z
         "terminal-grapheme-widths": z.boolean().optional(),
         // COMPAT(rewind): added in v0.1.X, drop the gate when floor >= v0.1.X.
         rewind: z.boolean().optional(),
+        targetedTaskBackgrounding: z.boolean().optional(),
         // COMPAT(agentTimelinePromptIndex): added in v0.2.X, drop the gate when floor >= v0.2.X.
         agentTimelinePromptIndex: z.boolean().optional(),
         // COMPAT(agentHistorySearch): added in v0.3.0, remove gate after 2027-02-07.
@@ -7805,6 +7856,7 @@ export const SessionOutboundMessageSchema = z.discriminatedUnion("type", [
   SetAgentFeatureResponseMessageSchema,
   AgentConfigApplyResponseMessageSchema,
   AgentDetachResponseMessageSchema,
+  AgentBackgroundTaskResponseMessageSchema,
   AgentRewindResponseMessageSchema,
   UpdateAgentResponseMessageSchema,
   ProjectRenameResponseSchema,

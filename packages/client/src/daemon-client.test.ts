@@ -10429,3 +10429,228 @@ test("disposing a route before its deferred close does not reopen it on origin r
   expect(opened).not.toHaveBeenCalled();
   expect(closed).toHaveBeenCalledTimes(1);
 });
+
+describe("targeted background control", () => {
+  const target = {
+    expectedTaskId: "native-task-a",
+    expectedNativeSessionId: "session-a",
+    expectedTurnId: "turn-a",
+    toolUseId: "tool-a",
+  };
+
+  test.each([undefined, false])("does not send to a host without support (%s)", async (feature) => {
+    const mock = createMockTransport();
+    const client = new DaemonClient({
+      url: "ws://test",
+      clientId: "background-test",
+      reconnect: { enabled: false },
+      transportFactory: () => mock.transport,
+    });
+    clients.push(client);
+    const connected = client.connect();
+    mock.triggerOpen({
+      features: feature === undefined ? {} : { targetedTaskBackgrounding: feature },
+    });
+    await connected;
+    const before = [...mock.sent];
+    expect(await client.backgroundAgentTask("agent-a", target)).toEqual({ status: "unsupported" });
+    expect(mock.sent).toEqual(before);
+  });
+
+  test.each(["requested", "refused", "stale"] as const)(
+    "preserves the native outcome %s",
+    async (status) => {
+      const mock = createMockTransport();
+      const client = new DaemonClient({
+        url: "ws://test",
+        clientId: "background-test",
+        reconnect: { enabled: false },
+        transportFactory: () => mock.transport,
+      });
+      clients.push(client);
+      const connected = client.connect();
+      mock.triggerOpen({ features: { targetedTaskBackgrounding: true } });
+      await connected;
+      const result = client.backgroundAgentTask("agent-a", target);
+      const request = parseSentFrame(mock.sent.at(-1));
+      expect(request).toEqual({
+        type: "agent.task.background.request",
+        agentId: "agent-a",
+        requestId: expect.any(String),
+        target,
+      });
+      mock.triggerMessage(
+        wrapSessionMessage({
+          type: "agent.task.background.response",
+          payload: { requestId: request.requestId, agentId: "agent-a", result: { status } },
+        }),
+      );
+      expect(await result).toEqual({ status });
+    },
+  );
+});
+
+test("targeted background control obtains its guard IDs from public inspection and timeline", async () => {
+  const mock = createMockTransport();
+  const client = new DaemonClient({
+    url: "ws://test",
+    clientId: "background-test",
+    reconnect: { enabled: false },
+    transportFactory: () => mock.transport,
+  });
+  clients.push(client);
+  const connected = client.connect();
+  mock.triggerOpen({ features: { targetedTaskBackgrounding: true } });
+  await connected;
+  const inspected = client.fetchAgent({ agentId: "agent-a", requestId: "inspect-a" });
+  mock.triggerMessage(
+    wrapSessionMessage({
+      type: "fetch_agent_response",
+      payload: {
+        requestId: "inspect-a",
+        error: null,
+        agent: {
+          id: "agent-a",
+          provider: "claude",
+          cwd: "/synthetic",
+          model: null,
+          createdAt: "2026-11-25T00:00:00Z",
+          updatedAt: "2026-11-25T00:00:00Z",
+          lastUserMessageAt: null,
+          status: "running",
+          activeTurn: { turnId: "turn-a", startedAt: null },
+          capabilities: {
+            supportsStreaming: true,
+            supportsSessionPersistence: true,
+            supportsDynamicModes: true,
+            supportsMcpServers: true,
+            supportsReasoningStream: true,
+            supportsToolInvocations: true,
+            supportsTaskBackgrounding: true,
+          },
+          currentModeId: null,
+          availableModes: [],
+          pendingPermissions: [],
+          persistence: { provider: "claude", sessionId: "session-a" },
+          title: null,
+        },
+      },
+    }),
+  );
+  const snapshot = (await inspected)?.agent;
+  if (!snapshot?.activeTurn || !snapshot.persistence) throw new Error("Missing guard identity");
+  const loaded = client.fetchAgentTimeline(snapshot.id, { requestId: "timeline-a" });
+  mock.triggerMessage(
+    wrapSessionMessage({
+      type: "fetch_agent_timeline_response",
+      payload: {
+        requestId: "timeline-a",
+        agentId: "agent-a",
+        agent: null,
+        direction: "tail",
+        projection: "projected",
+        epoch: "epoch-a",
+        reset: false,
+        staleCursor: false,
+        gap: false,
+        window: { minSeq: 1, maxSeq: 1, nextSeq: 2 },
+        startCursor: { epoch: "epoch-a", seq: 1 },
+        endCursor: { epoch: "epoch-a", seq: 1 },
+        hasOlder: false,
+        hasNewer: false,
+        entries: [
+          {
+            provider: "claude",
+            turnId: "turn-a",
+            timestamp: "2026-11-25T00:00:00Z",
+            seqStart: 1,
+            seqEnd: 1,
+            sourceSeqRanges: [{ startSeq: 1, endSeq: 1 }],
+            collapsed: [],
+            item: {
+              type: "tool_call",
+              callId: "tool-a",
+              metadata: {
+                nativeTask: {
+                  nativeSessionId: "session-a",
+                  turnId: "turn-a",
+                  toolUseId: "tool-a",
+                  taskId: "native-task-a",
+                  state: "foreground",
+                },
+              },
+              name: "Bash",
+              status: "running",
+              error: null,
+              detail: { type: "unknown", input: { command: "synthetic-test" }, output: null },
+            },
+          },
+        ],
+        error: null,
+      },
+    }),
+  );
+  const entry = (await loaded).entries[0];
+  if (entry?.item.type !== "tool_call" || !entry.item.callId)
+    throw new Error("Missing tool identity");
+  const nativeTask = entry.item.metadata?.nativeTask;
+  if (!nativeTask) throw new Error("Missing public native task identity");
+  const backgrounded = client.backgroundAgentTask(snapshot.id, {
+    expectedTaskId: nativeTask.taskId,
+    expectedNativeSessionId: snapshot.persistence.sessionId,
+    expectedTurnId: snapshot.activeTurn.turnId,
+    toolUseId: entry.item.callId,
+  });
+  const request = parseSentFrame(mock.sent.at(-1));
+  expect(request).toMatchObject({
+    type: "agent.task.background.request",
+    agentId: "agent-a",
+    target: {
+      expectedTaskId: "native-task-a",
+      expectedNativeSessionId: "session-a",
+      expectedTurnId: "turn-a",
+      toolUseId: "tool-a",
+    },
+  });
+  mock.triggerMessage(
+    wrapSessionMessage({
+      type: "agent.task.background.response",
+      payload: {
+        requestId: request.requestId,
+        agentId: "agent-a",
+        result: { status: "requested" },
+      },
+    }),
+  );
+  expect(await backgrounded).toEqual({ status: "requested" });
+});
+
+test("targeted background control keeps a lost reply unconfirmed without replay on reconnect", async () => {
+  const mock = createMockTransport();
+  const client = new DaemonClient({
+    url: "ws://test",
+    clientId: "background-test",
+    reconnect: { enabled: false },
+    transportFactory: () => mock.transport,
+  });
+  clients.push(client);
+  const connected = client.connect();
+  mock.triggerOpen({ features: { targetedTaskBackgrounding: true } });
+  await connected;
+  const pending = client.backgroundAgentTask("agent-a", {
+    expectedTaskId: "native-task-a",
+    expectedNativeSessionId: "session-a",
+    expectedTurnId: "turn-a",
+    toolUseId: "tool-a",
+  });
+  expect(parseSentFrame(mock.sent.at(-1))).toMatchObject({ type: "agent.task.background.request" });
+  mock.triggerClose({ code: 1006, reason: "network lost after dispatch" });
+  expect(await pending).toEqual({
+    status: "unconfirmed",
+    error: expect.stringMatching(/network lost|disconnected|closed/i),
+  });
+  const reconnecting = client.connect();
+  mock.triggerOpen({ features: { targetedTaskBackgrounding: true } });
+  await reconnecting;
+  expect(mock.sent).toEqual([]);
+});

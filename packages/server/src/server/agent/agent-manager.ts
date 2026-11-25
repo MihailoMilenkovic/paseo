@@ -1,3 +1,7 @@
+import type {
+  AgentBackgroundTaskTarget,
+  AgentBackgroundTaskResult,
+} from "@getpaseo/protocol/messages";
 import type { AttachedAgentTool, PluginAgentToolsRuntime } from "../plugins/agent-tools.js";
 import { ProviderOptionsValidationError } from "./provider-options.js";
 import type { AgentToolResult } from "@getpaseo/plugin/server";
@@ -3658,6 +3662,26 @@ export class AgentManager {
   ): Promise<AsyncGenerator<AgentStreamEvent>> {
     this.requireSessionAgent(agentId);
     return this.replaceRunInForegroundLane(agentId, prompt, options, promptStart);
+  }
+
+  async backgroundAgentTask(
+    agentId: string,
+    target: AgentBackgroundTaskTarget,
+  ): Promise<AgentBackgroundTaskResult> {
+    const { pending } = await this.runForegroundMutation(agentId, async () => {
+      await this.drainSessionEvents(agentId);
+      const agent = this.requireSessionAgent(agentId);
+      if ((agent.activeForegroundTurnId ?? agent.activeTurnId) !== target.expectedTurnId) {
+        return { pending: Promise.resolve<AgentBackgroundTaskResult>({ status: "stale" }) };
+      }
+      if (!agent.session.backgroundTask) {
+        return { pending: Promise.resolve<AgentBackgroundTaskResult>({ status: "unsupported" }) };
+      }
+      // Release admission after dispatch: a native reply without a deadline must not block
+      // later steering, replacement, or Stop from acquiring the foreground mutation lock.
+      return { pending: agent.session.backgroundTask(target) };
+    });
+    return pending;
   }
 
   async steerAgentRun(

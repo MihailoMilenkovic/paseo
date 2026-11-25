@@ -18,6 +18,8 @@ interface AgentInspect {
   Model: string;
   Thinking: string;
   Status: string;
+  NativeSessionId: string | null;
+  ActiveTurnId: string | null;
   Archived: boolean;
   ArchivedAt: string | null;
   Mode: string;
@@ -134,6 +136,8 @@ function toInspectData(snapshot: AgentSnapshotPayload): AgentInspect {
     Model: resolveModel(snapshot) ?? "-",
     Thinking: snapshot.effectiveThinkingOptionId ?? "auto",
     Status: snapshot.status,
+    NativeSessionId: snapshot.persistence?.sessionId ?? null,
+    ActiveTurnId: snapshot.activeTurn?.turnId ?? null,
     Archived: snapshot.archivedAt != null,
     ArchivedAt: snapshot.archivedAt ?? null,
     Mode: snapshot.currentModeId ?? "default",
@@ -163,6 +167,8 @@ function toInspectRows(agent: AgentInspect): InspectRow[] {
     { key: "Model", value: agent.Model },
     { key: "Thinking", value: agent.Thinking },
     { key: "Status", value: agent.Status },
+    { key: "NativeSessionId", value: agent.NativeSessionId ?? "null" },
+    { key: "ActiveTurnId", value: agent.ActiveTurnId ?? "null" },
     { key: "Archived", value: String(agent.Archived) },
     { key: "ArchivedAt", value: agent.ArchivedAt ?? "null" },
     { key: "Mode", value: agent.Mode },

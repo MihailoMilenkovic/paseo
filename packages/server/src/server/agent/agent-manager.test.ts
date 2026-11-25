@@ -16259,3 +16259,92 @@ test("importProviderSession keeps the stats the provider reported with its histo
     ["assistant_message", null],
   ]);
 });
+
+test("targeted background control releases the mutation lock while its native reply is pending", async () => {
+  const workdir = mkdtempSync(join(tmpdir(), "agent-manager-background-control-"));
+  const nativeRequestEntered = deferred<void>();
+  const nativeReply = deferred<{ status: "unconfirmed"; error: string }>();
+  class BackgroundSession extends SteeringTestSession {
+    readonly backgroundTask = vi.fn(async () => {
+      nativeRequestEntered.resolve();
+      return nativeReply.promise;
+    });
+  }
+  const session = new BackgroundSession({ provider: "codex", cwd: workdir });
+  const manager = new AgentManager({
+    clients: {
+      codex: new (class extends TestAgentClient {
+        override async createSession(): Promise<AgentSession> {
+          return session;
+        }
+      })(),
+    },
+    logger,
+  });
+  const agent = await manager.createAgent({ provider: "codex", cwd: workdir }, undefined, {
+    workspaceId: undefined,
+  });
+  const events: AgentStreamEvent[] = [];
+  let settled = false;
+  let pendingSteer: ReturnType<AgentManager["steerAgentRun"]> | null = null;
+  const consume = (async () => {
+    for await (const event of manager.streamAgent(agent.id, "run synthetic task"))
+      events.push(event);
+    settled = true;
+  })();
+  try {
+    await manager.waitForAgentRunStart(agent.id);
+    expect(await manager.steerAgentRun(agent.id, "queued while the task is still running")).toEqual(
+      { status: "accepted" },
+    );
+    const target = {
+      expectedTaskId: "native-task-a",
+      expectedNativeSessionId: session.id,
+      expectedTurnId: "active-turn-1",
+      toolUseId: "tool-a",
+    };
+    let replySettled = false;
+    const result = manager.backgroundAgentTask(agent.id, target).then((reply) => {
+      replySettled = true;
+      return reply;
+    });
+    await nativeRequestEntered.promise;
+    const steer = manager.steerAgentRun(agent.id, "new message while native reply is pending");
+    pendingSteer = steer;
+    await vi.waitFor(() => expect(session.steerCount).toBe(2), { timeout: 500 });
+    expect(await steer).toEqual({ status: "accepted" });
+    expect(replySettled).toBe(false);
+    nativeReply.resolve({ status: "unconfirmed", error: "Native response lost" });
+    expect(await result).toEqual({ status: "unconfirmed", error: "Native response lost" });
+    expect(session.backgroundTask.mock.calls).toEqual([[target]]);
+    expect({ settled, starts: session.startCount, interrupts: session.interruptCount }).toEqual({
+      settled: false,
+      starts: 1,
+      interrupts: 0,
+    });
+    session.pushEvent({
+      type: "timeline",
+      provider: "codex",
+      turnId: "active-turn-1",
+      item: { type: "assistant_message", text: "Original task output retained" },
+    });
+    session.pushEvent({ type: "turn_completed", provider: "codex", turnId: "active-turn-1" });
+    await consume;
+    expect(events).toEqual(
+      expect.arrayContaining([
+        expect.objectContaining({
+          type: "timeline",
+          item: { type: "assistant_message", text: "Original task output retained" },
+        }),
+        expect.objectContaining({ type: "turn_completed", turnId: "active-turn-1" }),
+      ]),
+    );
+  } finally {
+    nativeReply.resolve({ status: "unconfirmed", error: "Native response lost" });
+    await pendingSteer;
+    session.pushEvent({ type: "turn_completed", provider: "codex", turnId: "active-turn-1" });
+    await consume;
+    await manager.closeAgent(agent.id);
+    rmSync(workdir, { recursive: true, force: true });
+  }
+});

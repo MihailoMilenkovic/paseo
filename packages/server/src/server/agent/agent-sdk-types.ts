@@ -3,6 +3,8 @@ import type {
   AgentOptionControl,
   AgentOptionSelectControl,
   AgentOptionToggleControl,
+  AgentNativeTaskObservation,
+  ToolCallMetadata,
   AgentProviderNotice,
   AgentTaskItem,
   JsonValue,
@@ -10,7 +12,12 @@ import type {
   ToolPolicy,
 } from "@getpaseo/protocol/agent-types";
 import type { AgentMessage } from "@getpaseo/protocol/agent-message";
-import type { AgentAttachment, ProviderInstallationInspection } from "@getpaseo/protocol/messages";
+import type {
+  AgentBackgroundTaskTarget,
+  AgentBackgroundTaskResult,
+  AgentAttachment,
+  ProviderInstallationInspection,
+} from "@getpaseo/protocol/messages";
 import type {
   ProviderInspection,
   ProviderUpdateCheck,
@@ -24,6 +31,8 @@ export type {
   AgentOptionControl,
   AgentOptionSelectControl,
   AgentOptionToggleControl,
+  AgentNativeTaskObservation,
+  ToolCallMetadata,
   AgentProviderNotice,
   AgentTaskItem,
 };
@@ -189,6 +198,7 @@ export interface AgentCapabilityFlags {
   supportsRewindConversation?: boolean;
   supportsRewindFiles?: boolean;
   supportsRewindBoth?: boolean;
+  supportsTaskBackgrounding?: boolean;
 }
 
 export interface AgentPersistenceHandle {
@@ -359,7 +369,7 @@ interface ToolCallBase {
   callId: string;
   name: string;
   detail: ToolCallDetail;
-  metadata?: Record<string, unknown>;
+  metadata?: ToolCallMetadata;
   /** Set when the row is a delivered agent message rather than a provider tool call. */
   agentMessage?: AgentMessage;
 }
@@ -765,6 +775,8 @@ export interface AgentSession {
   interrupt(): Promise<void>;
   /** Stop one currently owned background item and wait for provider confirmation. */
   stopBackgroundWork?(id: string): Promise<void>;
+  backgroundTask?(target: AgentBackgroundTaskTarget): Promise<AgentBackgroundTaskResult>;
+
   /** True only when releasing this runtime loses no background work or pending replies.
    * An optional additional veto: missing methods use daemon baseline eligibility;
    * implemented checks that reject or return false keep the runtime resident. */
