@@ -1,4 +1,8 @@
-import type { SDKMessage } from "@anthropic-ai/claude-agent-sdk";
+import type {
+  SDKMessage,
+  SDKTaskStartedMessage,
+  SDKTaskUpdatedMessage,
+} from "@anthropic-ai/claude-agent-sdk";
 import { describe, expect, it, vi } from "vitest";
 
 import { ClaudeTaskProtocolSource } from "./live-source.js";
@@ -786,4 +790,152 @@ describe("ClaudeTaskProtocolSource effort from hooks", () => {
     expect(source.observeHook({} as never)).toEqual([]);
     expect(source.observeHook({ agent_id: 42, effort: { level: 7 } } as never)).toEqual([]);
   });
+});
+
+describe("native task projection", () => {
+  function nativeStarted(overrides: Partial<SDKTaskStartedMessage> = {}): SDKMessage {
+    return {
+      type: "system",
+      subtype: "task_started",
+      task_id: "native-a",
+      tool_use_id: "tool-a",
+      description: "Synthetic task",
+      task_type: "local_bash",
+      session_id: "session-a",
+      uuid: "00000000-0000-4000-8000-000000000001",
+      ...overrides,
+    };
+  }
+  function nativeUpdated(
+    patch: SDKTaskUpdatedMessage["patch"],
+    taskId = "native-a",
+    sessionId = "session-a",
+  ): SDKMessage {
+    return {
+      type: "system",
+      subtype: "task_updated",
+      task_id: taskId,
+      patch,
+      session_id: sessionId,
+      uuid: "00000000-0000-4000-8000-000000000002",
+    };
+  }
+  function source() {
+    return new ClaudeTaskProtocolSource({
+      getToolContext: () => ({ nativeSessionId: "session-a", turnId: "turn-a" }),
+    });
+  }
+
+  it("starts unknown and preserves observed placement across partial updates", () => {
+    const native = source();
+    expect(native.observeNativeTask(nativeStarted())).toEqual({
+      nativeSessionId: "session-a",
+      turnId: "turn-a",
+      toolUseId: "tool-a",
+      taskId: "native-a",
+      state: "unknown",
+    });
+    expect(native.observeNativeTask(nativeUpdated({ is_backgrounded: false }))?.state).toBe(
+      "foreground",
+    );
+    expect(native.observeNativeTask(nativeUpdated({ status: "running" }))).toBeNull();
+    expect(native.getNativeTask("tool-a")?.state).toBe("foreground");
+    expect(native.observeNativeTask(nativeUpdated({ is_backgrounded: true }))?.state).toBe(
+      "background",
+    );
+    expect(native.observeNativeTask(nativeStarted())).toBeNull();
+    expect(native.getNativeTask("tool-a")?.state).toBe("background");
+    expect(native.observeNativeTask(nativeUpdated({ status: "completed" }))?.state).toBe(
+      "completed",
+    );
+    expect(native.observeNativeTask(nativeUpdated({ is_backgrounded: false }))).toBeNull();
+    expect(native.getNativeTask("tool-a")?.state).toBe("completed");
+  });
+
+  it("ignores mismatched session, task, and tool identities", () => {
+    const native = source();
+    expect(native.observeNativeTask(nativeStarted({ session_id: "different-session" }))).toBeNull();
+    const original = native.observeNativeTask(nativeStarted({ is_backgrounded: false }));
+    expect(
+      native.observeNativeTask(nativeUpdated({ is_backgrounded: true }, "different-task")),
+    ).toBeNull();
+    expect(
+      native.observeNativeTask(
+        nativeUpdated({ is_backgrounded: true }, "native-a", "different-session"),
+      ),
+    ).toBeNull();
+    expect(native.observeNativeTask(nativeStarted({ tool_use_id: "different-tool" }))).toBeNull();
+    expect(native.getNativeTask("tool-a")).toEqual(original);
+  });
+
+  it("ignores announcements and lifecycle updates from a different native run", () => {
+    const native = source();
+    const original = native.observeNativeTask(
+      nativeStarted({ is_backgrounded: false, run_id: "run-b" }),
+    );
+    expect(
+      native.observeNativeTask(nativeStarted({ is_backgrounded: true, run_id: "run-a" })),
+    ).toBeNull();
+    expect(
+      native.observeNativeTask({ ...nativeUpdated({ status: "completed" }), run_id: "run-a" }),
+    ).toBeNull();
+    expect(native.getNativeTask("tool-a")).toEqual(original);
+    expect(
+      native.observeNativeTask({ ...nativeUpdated({ is_backgrounded: true }), run_id: "run-b" })
+        ?.state,
+    ).toBe("background");
+  });
+
+  it("preserves original turn identity after another turn starts", () => {
+    let turnId = "turn-a";
+    const native = new ClaudeTaskProtocolSource({
+      getToolContext: () => ({ nativeSessionId: "session-a", turnId }),
+    });
+    native.observeNativeTask(nativeStarted({ is_backgrounded: false }));
+    turnId = "turn-b";
+    expect(native.observeNativeTask(nativeUpdated({ is_backgrounded: true }))).toEqual({
+      nativeSessionId: "session-a",
+      turnId: "turn-a",
+      toolUseId: "tool-a",
+      taskId: "native-a",
+      state: "background",
+    });
+  });
+
+  it("clears native admission when the session source resets", () => {
+    const native = source();
+    native.observeNativeTask(nativeStarted({ is_backgrounded: false }));
+    native.reset();
+    expect(native.getNativeTask("tool-a")).toBeUndefined();
+    expect(native.observeNativeTask(nativeUpdated({ is_backgrounded: true }))).toBeNull();
+  });
+
+  it("retains Bash lifecycle without declaring a provider subagent", () => {
+    const native = source();
+    const started = nativeStarted({ is_backgrounded: false });
+    expect(native.observeNativeTask(started)?.state).toBe("foreground");
+    expect(native.observe(started)).toEqual([]);
+    expect(native.isActive).toBe(false);
+  });
+
+  it.each(["completed", "failed", "stopped"] as const)(
+    "retains terminal native notification state %s",
+    (status) => {
+      const native = source();
+      native.observeNativeTask(nativeStarted({ is_backgrounded: true }));
+      expect(
+        native.observeNativeTask({
+          type: "system",
+          subtype: "task_notification",
+          task_id: "native-a",
+          tool_use_id: "tool-a",
+          status,
+          output_file: "/synthetic/output",
+          summary: "Synthetic completion",
+          session_id: "session-a",
+          uuid: "00000000-0000-4000-8000-000000000003",
+        })?.state,
+      ).toBe(status);
+    },
+  );
 });

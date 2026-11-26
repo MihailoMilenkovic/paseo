@@ -1,3 +1,7 @@
+import type {
+  AgentBackgroundTaskTarget,
+  AgentBackgroundTaskResult,
+} from "@getpaseo/protocol/messages";
 import {
   DiffStreamRouter,
   DiffSubscriptionError,
@@ -4385,6 +4389,38 @@ export class DaemonClient {
       throw new Error(payload.error ?? "Agent rewind failed");
     }
     return payload;
+  }
+
+  async backgroundAgentTask(
+    agentId: string,
+    target: AgentBackgroundTaskTarget,
+  ): Promise<AgentBackgroundTaskResult> {
+    if (this.lastServerInfoMessage?.features?.targetedTaskBackgrounding !== true) {
+      return { status: "unsupported" };
+    }
+    const requestId = this.createRequestId();
+    const message = SessionInboundMessageSchema.parse({
+      type: "agent.task.background.request",
+      requestId,
+      agentId,
+      target,
+    });
+    try {
+      return await this.sendRequest({
+        requestId,
+        message,
+        options: { skipQueue: true },
+        select: (msg) =>
+          msg.type === "agent.task.background.response" && msg.payload.requestId === requestId
+            ? msg.payload.result
+            : null,
+      });
+    } catch (error) {
+      return {
+        status: "unconfirmed",
+        error: error instanceof Error ? error.message : String(error),
+      };
+    }
   }
 
   async cancelAgent(agentId: string): Promise<void> {

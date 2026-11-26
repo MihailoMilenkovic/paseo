@@ -3225,6 +3225,8 @@ export class Session {
         return this.handleProviderSubagentListRequest(msg);
       case "agent.background_work.list.request":
         return this.handleAgentBackgroundWorkListRequest(msg);
+      case "agent.task.background.request":
+        return this.handleBackgroundAgentTaskRequest(msg);
       case "agent.background_work.stop.request":
         return this.handleAgentBackgroundWorkStopRequest(msg);
       case "agent.provider_subagents.timeline.get.request":
@@ -5419,6 +5421,16 @@ export class Session {
         this.handleAgentRunError(agentId, error, "Failed to cancel running agent on request");
       }
     }
+  }
+
+  private async handleBackgroundAgentTaskRequest(
+    msg: Extract<SessionInboundMessage, { type: "agent.task.background.request" }>,
+  ): Promise<void> {
+    const result = await this.agentManager.backgroundAgentTask(msg.agentId, msg.target);
+    this.emit({
+      type: "agent.task.background.response",
+      payload: { requestId: msg.requestId, agentId: msg.agentId, result },
+    });
   }
 
   private async handleAgentRewindRequest(

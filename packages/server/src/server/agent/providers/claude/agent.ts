@@ -1,3 +1,7 @@
+import type {
+  AgentBackgroundTaskTarget,
+  AgentBackgroundTaskResult,
+} from "@getpaseo/protocol/messages";
 import { setImmediate } from "node:timers/promises";
 import { ClaudeResultMeter } from "./metrics.js";
 import { ClaudeRuntimeSafety } from "./runtime-safety.js";
@@ -119,6 +123,7 @@ import {
   getAgentStreamEventTurnId,
   type AgentPermissionAction,
   type AgentCapabilityFlags,
+  type AgentNativeTaskObservation,
   type AgentClient,
   type AgentCreateSessionOptions,
   type AgentDraftControls,
@@ -400,6 +405,7 @@ const CLAUDE_CAPABILITIES: AgentCapabilityFlags = {
   supportsRewindConversation: true,
   supportsRewindFiles: true,
   supportsRewindBoth: true,
+  supportsTaskBackgrounding: true,
 };
 
 const DEFAULT_MODES: AgentMode[] = [
@@ -978,6 +984,7 @@ interface ToolUseCacheEntry {
   server: string;
   classification: ToolUseClassification;
   started: boolean;
+  turnId: string | null;
   commandText?: string;
   files?: { path: string; kind: string }[];
   input?: AgentMetadata | null;
@@ -1003,6 +1010,7 @@ function createDefaultToolUseCacheEntry(id: string, block: ClaudeContentChunk): 
     server,
     classification: "generic",
     started: false,
+    turnId: null,
   };
 }
 
@@ -2468,15 +2476,21 @@ class ClaudeAgentSession implements AgentSession {
   private readonly timelineAssembler = new TimelineAssembler();
   private readonly taskState = new ClaudeTaskState();
   private readonly taskProtocolSource = new ClaudeTaskProtocolSource({
+    getToolContext: (toolUseId) => {
+      const turnId = this.toolUseCache.get(toolUseId)?.turnId;
+      return turnId && this.claudeSessionId
+        ? { nativeSessionId: this.claudeSessionId, turnId }
+        : null;
+    },
     getToolInput: (toolUseId) => this.toolUseCache.get(toolUseId)?.input ?? null,
     readWorkflowResult: readClaudeWorkflowResultFile,
   });
   /**
-   * Subagent tool calls Claude has already answered while the child still runs, with the input
-   * they were launched with and the turn that answered them. A background child is answered at
-   * launch and streams its frames afterwards.
+   * Task-launch tool calls Claude has answered while native work continues. Keep the original
+   * card, input, and turn after the foreground tool cache is cleared, so later task updates can
+   * update that same card without reopening the tool call.
    */
-  private readonly settledSubagentToolCalls = new Map<
+  private readonly settledTaskToolCalls = new Map<
     string,
     {
       item: Extract<AgentTimelineItem, { type: "tool_call" }>;
@@ -2487,7 +2501,7 @@ class ClaudeAgentSession implements AgentSession {
   private readonly sidechainTracker = new ClaudeSidechainTracker({
     getToolInput: (toolUseId) =>
       this.toolUseCache.get(toolUseId)?.input ??
-      this.settledSubagentToolCalls.get(toolUseId)?.input ??
+      this.settledTaskToolCalls.get(toolUseId)?.input ??
       null,
     // Releases that predate the task protocol announce nothing, so the tracker keeps deriving
     // identity and status from frames for them. Detecting the capability beats comparing version
@@ -2497,9 +2511,9 @@ class ClaudeAgentSession implements AgentSession {
     // card is rebuilt from the settled call: a running one would replace the settled, labeled card.
     // Late card updates retain the turn that answered the call.
     needsSyntheticParentToolCard: (toolUseId) =>
-      (this.toolUseCache.has(toolUseId) || this.settledSubagentToolCalls.has(toolUseId)) &&
+      (this.toolUseCache.has(toolUseId) || this.settledTaskToolCalls.has(toolUseId)) &&
       this.taskProtocolSource.needsSyntheticParentToolCard(toolUseId),
-    getSettledParentToolCall: (toolUseId) => this.settledSubagentToolCalls.get(toolUseId)?.item,
+    getSettledParentToolCall: (toolUseId) => this.settledTaskToolCalls.get(toolUseId)?.item,
   });
   private persistedHistory: PersistedTimelineEntry[] = [];
   private persistedProviderSubagentEvents: Extract<
@@ -2807,6 +2821,52 @@ class ClaudeAgentSession implements AgentSession {
     }
     this.enqueueSteer(input, message, options.clearPendingPermissions === true);
     return { status: "accepted", ...(message.uuid ? { providerMessageId: message.uuid } : {}) };
+  }
+
+  async backgroundTask(target: AgentBackgroundTaskTarget): Promise<AgentBackgroundTaskResult> {
+    const query = this.activeForegroundQuery;
+    if (!query || this.query !== query || !this.matchesForegroundTask(target)) {
+      return { status: "stale" };
+    }
+    if (typeof query.backgroundTasks !== "function") {
+      return { status: "unsupported" };
+    }
+    const task = this.taskProtocolSource.getNativeTask(target.toolUseId);
+    if (!task || task.state !== "foreground") return { status: "refused" };
+    if (
+      task.taskId !== target.expectedTaskId ||
+      task.nativeSessionId !== target.expectedNativeSessionId ||
+      task.turnId !== target.expectedTurnId
+    ) {
+      return { status: "stale" };
+    }
+    try {
+      // No await separates the identity checks from dispatch. Never omit the ID: the SDK then
+      // targets every task. A true reply acknowledges the request, not observed background state.
+      return (await query.backgroundTasks(target.toolUseId))
+        ? { status: "requested" }
+        : { status: "refused" };
+    } catch (error) {
+      return {
+        status: "unconfirmed",
+        error: error instanceof Error ? error.message : String(error),
+      };
+    }
+  }
+
+  private matchesForegroundTask(target: AgentBackgroundTaskTarget): boolean {
+    const entry = this.toolUseCache.get(target.toolUseId);
+    return Boolean(
+      target.toolUseId &&
+      target.expectedTurnId &&
+      target.expectedNativeSessionId &&
+      this.claudeSessionId === target.expectedNativeSessionId &&
+      (this.activeForegroundTurnId ?? this.autonomousTurn?.id) === target.expectedTurnId &&
+      !this.compacting &&
+      entry?.started &&
+      entry.turnId === target.expectedTurnId &&
+      ["Bash", "Agent", "Task"].includes(entry.name),
+    );
   }
 
   private enqueueSteer(
@@ -3322,7 +3382,7 @@ class ClaudeAgentSession implements AgentSession {
     this.cancelCurrentTurn = null;
     this.turnState = "idle";
     this.sidechainTracker.clear();
-    this.settledSubagentToolCalls.clear();
+    this.settledTaskToolCalls.clear();
     this.taskProtocolSource.reset();
     this.input?.end();
     this.query?.close?.();
@@ -4454,13 +4514,17 @@ class ClaudeAgentSession implements AgentSession {
   private failRunningRuntimeTasks(): void {
     for (const finish of this.backgroundStops.values()) finish("connection lost");
     this.runtimeSafety.retire();
-    this.dispatchEvents([
+    const events: AgentStreamEvent[] = [];
+    for (const task of this.taskProtocolSource.failRunningNativeTasks()) {
+      this.appendNativeTaskEvent(task, events);
+    }
+    events.push(
       ...foldSubagentObservations(this.taskProtocolSource.failRunningTasks()).map(
         (event): AgentStreamEvent => ({ type: "provider_subagent", provider: "claude", event }),
       ),
-      // The SDK resets its background task set when the CLI process (re)starts.
-      { type: "background_work", provider: "claude", items: null },
-    ]);
+    );
+    events.push({ type: "background_work", provider: "claude", items: null });
+    this.dispatchEvents(events);
   }
 
   private startQueryPump(): void {
@@ -4937,6 +5001,8 @@ class ClaudeAgentSession implements AgentSession {
 
     const events: AgentStreamEvent[] = [];
     this.appendTaskStateEvent(message, events);
+    const nativeTask = this.taskProtocolSource.observeNativeTask(message);
+    this.appendNativeTaskEvent(nativeTask, events);
 
     // Subagent identity and lifecycle are announced by Claude Code's task protocol, so they are
     // read rather than inferred from sidechain frames. `task_started` precedes the child's first
@@ -5015,6 +5081,35 @@ class ClaudeAgentSession implements AgentSession {
     this.permissionClearingSteerUuids.delete(lifecycle.commandUuid);
   }
 
+  private appendNativeTaskEvent(
+    nativeTask: AgentNativeTaskObservation | null,
+    events: AgentStreamEvent[],
+  ): void {
+    if (!nativeTask) return;
+    const cached = this.toolUseCache.get(nativeTask.toolUseId);
+    const settled = this.settledTaskToolCalls.get(nativeTask.toolUseId);
+    const card =
+      settled?.item ??
+      (cached
+        ? mapClaudeRunningToolCall({
+            name: cached.name,
+            callId: cached.id,
+            input: cached.input ?? null,
+            output: null,
+          })
+        : null);
+    if (card)
+      events.push({
+        type: "timeline",
+        provider: "claude",
+        turnId: nativeTask.turnId,
+        item: { ...card, metadata: { ...card.metadata, nativeTask } },
+      });
+    if (["completed", "failed", "stopped"].includes(nativeTask.state)) {
+      this.settledTaskToolCalls.delete(nativeTask.toolUseId);
+    }
+  }
+
   private appendTaskStateEvent(message: SDKMessage, events: AgentStreamEvent[]): void {
     const item = this.taskState.observe(message);
     if (item) events.push({ type: "timeline", provider: "claude", item });
@@ -5046,7 +5141,7 @@ class ClaudeAgentSession implements AgentSession {
       ),
     ).map((event): AgentStreamEvent => ({ type: "provider_subagent", provider: "claude", event }));
     const routedId = canonicalSubagentId ?? parentToolUseId;
-    const settled = this.settledSubagentToolCalls.get(routedId);
+    const settled = this.settledTaskToolCalls.get(routedId);
     const sidechainEvents = this.sidechainTracker.handleMessage(message, routedId).map((event) => {
       if (event.type === "timeline" && settled?.turnId) event.turnId = settled.turnId;
       return event;
@@ -5075,10 +5170,15 @@ class ClaudeAgentSession implements AgentSession {
       output: null,
     });
     if (!toolCall) return null;
+    const nativeTask = this.taskProtocolSource.getNativeTask(declaration.id);
     return {
       type: "timeline",
       provider: "claude",
-      item: { ...toolCall, detail: buildClaudeSubagentCardDetail(declaration) },
+      item: {
+        ...toolCall,
+        detail: buildClaudeSubagentCardDetail(declaration),
+        ...(nativeTask ? { metadata: { ...toolCall.metadata, nativeTask } } : {}),
+      },
     };
   }
 
@@ -5725,11 +5825,13 @@ class ClaudeAgentSession implements AgentSession {
     if (!item) {
       return;
     }
+    const nativeTask = this.taskProtocolSource.getNativeTask(item.callId);
+    const observed = nativeTask ? { ...item, metadata: { ...item.metadata, nativeTask } } : item;
     if (target) {
-      target.push(item);
+      target.push(observed);
       return;
     }
-    this.enqueueTimeline(item);
+    this.enqueueTimeline(observed);
   }
 
   private pushEvent(event: AgentStreamEvent) {
@@ -6162,6 +6264,7 @@ class ClaudeAgentSession implements AgentSession {
       return;
     }
     entry.started = true;
+    entry.turnId = this.activeForegroundTurnId ?? this.autonomousTurn?.id ?? null;
     this.toolUseCache.set(entry.id, entry);
     this.pushToolCall(
       mapClaudeRunningToolCall({
@@ -6207,7 +6310,7 @@ class ClaudeAgentSession implements AgentSession {
           output: output ?? null,
         });
     this.pushToolCall(settledToolCall, items);
-    this.rememberSettledSubagentToolCall(settledToolCall, entry);
+    this.rememberSettledTaskToolCall(settledToolCall, entry);
 
     for (const image of images) {
       const imageItem = await renderProviderImageOutputAsAssistantMarkdown(image, {
@@ -6223,16 +6326,25 @@ class ClaudeAgentSession implements AgentSession {
     }
   }
 
-  private rememberSettledSubagentToolCall(
+  private rememberSettledTaskToolCall(
     item: Extract<AgentTimelineItem, { type: "tool_call" }> | null,
     entry: ToolUseCacheEntry | undefined,
   ): void {
-    const subagentId = item ? this.taskProtocolSource.resolveSubagentId(item.callId) : undefined;
-    if (!item || !subagentId) return;
-    this.settledSubagentToolCalls.set(subagentId, {
+    if (!item) return;
+    const nativeTask = this.taskProtocolSource.getNativeTask(item.callId);
+    const subagentId = this.taskProtocolSource.resolveSubagentId(item.callId);
+    const retainedId = subagentId ?? (nativeTask ? item.callId : undefined);
+    if (!retainedId) return;
+    if (nativeTask && ["completed", "failed", "stopped"].includes(nativeTask.state)) return;
+    this.settledTaskToolCalls.set(retainedId, {
       item,
       input: entry?.input ?? null,
-      turnId: this.activeForegroundTurnId ?? this.autonomousTurn?.id ?? null,
+      turnId:
+        nativeTask?.turnId ??
+        entry?.turnId ??
+        this.activeForegroundTurnId ??
+        this.autonomousTurn?.id ??
+        null,
     });
   }
 
@@ -6240,7 +6352,7 @@ class ClaudeAgentSession implements AgentSession {
   private releaseFinishedSubagentToolCalls(observations: SubagentObservation[]): void {
     for (const observation of observations) {
       if (observation.kind === "status" && observation.status !== "running") {
-        this.settledSubagentToolCalls.delete(observation.id);
+        this.settledTaskToolCalls.delete(observation.id);
         this.sidechainTracker.delete(observation.id);
       }
     }

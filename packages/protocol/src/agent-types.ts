@@ -189,6 +189,7 @@ export interface AgentCapabilityFlags {
   supportsRewindConversation?: boolean;
   supportsRewindFiles?: boolean;
   supportsRewindBoth?: boolean;
+  supportsTaskBackgrounding?: boolean;
 }
 
 export interface AgentPersistenceHandle {
@@ -346,6 +347,18 @@ export type ToolCallDetail =
       output: unknown;
     };
 
+export interface AgentNativeTaskObservation {
+  readonly nativeSessionId: string;
+  readonly turnId: string;
+  readonly toolUseId: string;
+  readonly taskId: string;
+  readonly state: "unknown" | "foreground" | "background" | "completed" | "failed" | "stopped";
+}
+
+export interface ToolCallMetadata extends Record<string, unknown> {
+  nativeTask?: AgentNativeTaskObservation;
+}
+
 interface ToolCallBase {
   agentMessage?: AgentMessage;
   [key: string]: unknown;
@@ -353,7 +366,7 @@ interface ToolCallBase {
   callId: string;
   name: string;
   detail: ToolCallDetail;
-  metadata?: Record<string, unknown>;
+  metadata?: ToolCallMetadata;
 }
 
 type ToolCallRunningTimelineItem = ToolCallBase & {

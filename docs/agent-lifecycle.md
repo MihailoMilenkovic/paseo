@@ -117,6 +117,54 @@ older cancellation from settling a newer turn. If interruption is rejected or ti
 keeps its active foreground turn and replacement, reload, rewind, and Stop report the failure.
 Accepting new work after an ambiguous interruption would create a split-brain session.
 
+## Background one native task
+
+Hosts advertise `features.targetedTaskBackgrounding`. Claude sessions advertise
+`capabilities.supportsTaskBackgrounding`; other providers do not gain this capability.
+The client returns `unsupported` without dispatch when the host lacks the feature.
+
+Read `fetchAgent().agent.persistence.sessionId` and `activeTurn.turnId`, then read a running
+`tool_call` from `fetchAgentTimeline()`. Its typed `metadata.nativeTask` carries the observed
+native session, original turn, tool-use ID, task ID, and task state. Only `foreground` is eligible.
+Use that observation's task ID as `expectedTaskId` and pass the exact session/turn/tool identity
+to `backgroundAgentTask(agentId, target)`. An unregistered or unknown task is refused locally
+without dispatch. The server serializes admission and dispatch with foreground mutations, then releases the lock before awaiting the
+native reply. A lost native reply must not block steering, replacement, or Stop. The provider
+checks the native session, turn, query, native task, and unfinished tool immediately before dispatch.
+A missing or stale identity returns `stale`. It never widens a missing tool ID to all tasks.
+
+The CLI exposes the same operation:
+
+```sh
+paseo agent inspect <agent-id> --json
+paseo agent background <agent-id> --native-session <session-id> --turn <turn-id> --tool <tool-use-id> --task <native-task-id> --json
+```
+
+Inspection includes `NativeSessionId` and `ActiveTurnId`. Obtain the tool-use ID from the
+public timeline API. The operation does not interrupt a turn, send a message, or create another
+agent. It preserves the existing runtime and tool-result path.
+
+| Result        | Meaning                                                                                                   |
+| ------------- | --------------------------------------------------------------------------------------------------------- |
+| `requested`   | The SDK acknowledged the request. Observe matching native task state before reporting it as backgrounded. |
+| `refused`     | No observed foreground task is eligible, or the SDK returned false.                                       |
+| `unsupported` | The host or provider has no background-task operation.                                                    |
+| `stale`       | The captured session, turn, query, or active tool no longer matches.                                      |
+| `unconfirmed` | Dispatch or its reply failed. The error is retained; no automatic retry occurs.                           |
+
+A running Bash tool card alone does not establish eligibility. Wait for the matching native
+`task_started` observation; do not use an elapsed-time threshold. A completed tool call may still
+own a `background` native task: its immediate tool result releases the turn, while the process
+continues. Later task updates retain the original session/turn/tool/task identity, including after
+a new turn starts. Partial updates preserve the last observed state; missing flags stay unknown.
+If the native runtime exits, remaining nonterminal tasks become failed under their original
+identities and turns. A completed launch-tool result stays completed while its task records failure.
+
+Claude's `task_updated.patch.is_backgrounded` reports the native transition for tasks that
+emit it. A request acknowledgement alone does not prove that transition. Background work keeps
+its existing lifecycle and completion notifications. This control does not change message
+priority or use Stop as a substitute.
+
 ## Relationships
 
 Agents can launch other agents via the agent-scoped `create_agent` MCP tool. Agent-scoped creation is always asynchronous and always stamps `paseo.parent-agent-id`, pointing back at the caller. Omit `workspaceId` to use the caller's workspace, or pass an existing workspace ID returned by `create_workspace`. Placement never changes parentage.

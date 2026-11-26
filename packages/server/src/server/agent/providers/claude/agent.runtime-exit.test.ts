@@ -219,6 +219,116 @@ describe("Claude runtime exit", () => {
     }
   });
 
+  test("fails retained native Bash task metadata when its idle runtime exits", async () => {
+    let capturedOptions: Options | undefined;
+    const queryFactory = vi.fn(({ options }: ClaudeQueryInput) => {
+      capturedOptions = options;
+      return createQueryMock(
+        [
+          COMPLETED_TURN_EVENTS[0],
+          {
+            type: "assistant",
+            message: {
+              content: [
+                {
+                  type: "tool_use",
+                  id: "toolu_shell",
+                  name: "Bash",
+                  input: { command: "synthetic-command" },
+                },
+              ],
+            },
+          },
+          {
+            type: "system",
+            subtype: "task_started",
+            task_id: "native-shell-a",
+            tool_use_id: "toolu_shell",
+            task_type: "local_bash",
+            description: "Synthetic shell",
+            is_backgrounded: false,
+            session_id: "claude-runtime-exit-session",
+            uuid: "00000000-0000-4000-8000-000000000001",
+          },
+          {
+            type: "system",
+            subtype: "task_updated",
+            task_id: "native-shell-a",
+            patch: { is_backgrounded: true },
+            session_id: "claude-runtime-exit-session",
+            uuid: "00000000-0000-4000-8000-000000000002",
+          },
+          {
+            type: "user",
+            session_id: "claude-runtime-exit-session",
+            message: {
+              role: "user",
+              content: [
+                {
+                  type: "tool_result",
+                  tool_use_id: "toolu_shell",
+                  content: "Running in the background",
+                },
+              ],
+            },
+          },
+          COMPLETED_TURN_EVENTS[2],
+        ],
+        { tail: new Promise<never>(() => undefined) },
+      );
+    });
+    const child = createChildProcessStub();
+    vi.spyOn(spawnUtils, "spawnProcess").mockReturnValue(child);
+    const client = new ClaudeAgentClient({
+      logger: createTestLogger(),
+      queryFactory,
+      resolveBinary: async () => "/test/claude/bin",
+    });
+    const session = await client.createSession({ provider: "claude", cwd: process.cwd() });
+    const events: AgentStreamEvent[] = [];
+    session.subscribe((event) => events.push(event));
+    try {
+      await session.run("run a synthetic shell in the background");
+      const before = events.findLast(
+        (event) =>
+          event.type === "timeline" &&
+          event.item.type === "tool_call" &&
+          event.item.status === "completed" &&
+          event.item.metadata?.nativeTask?.state === "background",
+      );
+      if (!before || before.type !== "timeline" || before.item.type !== "tool_call")
+        throw new Error("Missing completed tool with background native task");
+      const original = before.item.metadata?.nativeTask;
+      expect(original).toMatchObject({
+        nativeSessionId: "claude-runtime-exit-session",
+        taskId: "native-shell-a",
+        toolUseId: "toolu_shell",
+        state: "background",
+      });
+      capturedOptions?.spawnClaudeCodeProcess?.(SPAWN_OPTIONS);
+      child.emit("exit", 1, null);
+      const failures = events.filter(
+        (event) =>
+          event.type === "timeline" &&
+          event.item.type === "tool_call" &&
+          event.item.metadata?.nativeTask?.state === "failed",
+      );
+      expect(failures).toEqual([
+        expect.objectContaining({
+          type: "timeline",
+          turnId: before.turnId,
+          item: expect.objectContaining({
+            callId: "toolu_shell",
+            status: "completed",
+            metadata: { nativeTask: { ...original, state: "failed" } },
+          }),
+        }),
+      ]);
+    } finally {
+      await session.close();
+    }
+  });
+
   test("stays quiet when the process exits during an intentional teardown", async () => {
     let capturedOptions: Options | undefined;
     const queryFactory = vi.fn(({ options }: ClaudeQueryInput) => {
